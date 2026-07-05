@@ -1,0 +1,1346 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  HyperMorphic Corridor Codes (HCC)                                          ║
+║  A State-Adaptive Invariant-Spanning Coding Primitive                       ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║  WHAT IS NEW                                                                 ║
+║  ────────────────────────────────────────────────────────────────────────    ║
+║  HTC changes the coding geometry with local entropy, but still mostly asks: ║
+║                                                                              ║
+║      "Do I have at least k valid shards?"                                    ║
+║                                                                              ║
+║  HCC changes the decoding condition itself. It asks:                         ║
+║                                                                              ║
+║      "Do the surviving shards form a valid reconstruction corridor?"         ║
+║                                                                              ║
+║  A valid corridor requires:                                                   ║
+║                                                                              ║
+║    1. ALGEBRAIC CAPACITY                                                     ║
+║       The product of selected CRT moduli must exceed chunk capacity.          ║
+║                                                                              ║
+║    2. GEOMETRIC LANE COVERAGE                                                ║
+║       Surviving shards must span enough independent representation lanes.     ║
+║                                                                              ║
+║    3. CORRIDOR SCORE                                                         ║
+║       The subset must have enough lane diversity, angular spread, and         ║
+║       capacity margin for the current entropy/state regime.                  ║
+║                                                                              ║
+║  This means the threshold is no longer a fixed scalar k.                     ║
+║                                                                              ║
+║      k_t = f(H_t, geometry_span, capacity_margin, lane_diversity)            ║
+║                                                                              ║
+║  Same number of shards can pass or fail depending on their geometry.         ║
+║                                                                              ║
+║  FORMAL OBJECT                                                               ║
+║  ────────────────────────────────────────────────────────────────────────    ║
+║  HCC(n, D, W, E_levels, k_low, k_high) where:                                ║
+║                                                                              ║
+║    n          = total shards                                                  ║
+║    D          = number of representation lanes / geometry axes               ║
+║    W          = causal entropy window                                         ║
+║    E_levels   = entropy quantization levels                                  ║
+║    k_low      = minimum shard count in low-complexity states                 ║
+║    k_high     = minimum shard count in high-complexity states                ║
+║                                                                              ║
+║  At each chunk position pos:                                                  ║
+║                                                                              ║
+║    H(pos)       = entropy of previous W decoded chunks                       ║
+║    e(pos)       = quantized entropy state                                    ║
+║    p_i(e)       = adaptive prime for shard i                                 ║
+║    b_i(e)       = SafeGear base, gcd(b_i, p_i)=1                             ║
+║    λ_i(pos,e)   = SHAKE128-derived position/state mixing term                ║
+║                                                                              ║
+║  Encoding:                                                                    ║
+║                                                                              ║
+║    r_i(pos) = (b_i(e) · C(pos) + λ_i(pos,e)) mod p_i(e)                     ║
+║                                                                              ║
+║  Decoding from selected corridor S:                                           ║
+║                                                                              ║
+║    c_i(pos) = (r_i(pos) - λ_i(pos,e)) · b_i(e)^(-1) mod p_i(e)              ║
+║    C(pos)   = CRT({c_i mod p_i(e)} for i in S)                              ║
+║                                                                              ║
+║  Corridor validity:                                                           ║
+║                                                                              ║
+║    ∏_{i∈S} p_i(e) > 256^chunk_bytes                                          ║
+║    lanes(S) ≥ required_lanes(e)                                              ║
+║    |S|      ≥ required_shards(e)                                             ║
+║    score(S,e) ≥ required_score(e)                                            ║
+║                                                                              ║
+║  IMPORTANT                                                                    ║
+║  ────────────────────────────────────────────────────────────────────────    ║
+║  This is a research prototype, not production cryptography. The HMAC layer   ║
+║  is for integrity/testing, not a full security model.                        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import math
+import os
+import time
+import copy
+import hmac
+import hashlib
+from dataclasses import dataclass
+from functools import reduce
+from itertools import combinations
+from collections import Counter, defaultdict
+from typing import List, Tuple, Dict, Optional
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 1 — MATHEMATICAL FOUNDATION
+# ═══════════════════════════════════════════════════════════════════════
+
+def _egcd(a: int, b: int):
+    if a == 0:
+        return b, 0, 1
+    g, x, y = _egcd(b % a, a)
+    return g, y - (b // a) * x, x
+
+
+def modinv(a: int, m: int) -> int:
+    g, x, _ = _egcd(a % m, m)
+    if g != 1:
+        raise ArithmeticError(f"No inverse: gcd({a},{m})={g}")
+    return x % m
+
+
+def crt(residues: List[int], moduli: List[int]) -> int:
+    """
+    Chinese Remainder Theorem reconstruction.
+    Moduli must be pairwise coprime.
+    """
+    M = reduce(lambda a, b: a * b, moduli, 1)
+    x = 0
+
+    for r, m in zip(residues, moduli):
+        Mi = M // m
+        x += r * Mi * modinv(Mi % m, m)
+
+    return x % M
+
+
+def is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    if n < 4:
+        return True
+    if n % 2 == 0 or n % 3 == 0:
+        return False
+
+    i = 5
+    while i * i <= n:
+        if n % i == 0 or n % (i + 2) == 0:
+            return False
+        i += 6
+
+    return True
+
+
+def primes_from(start: int, count: int) -> List[int]:
+    out = []
+    x = start if start % 2 else start + 1
+
+    while len(out) < count:
+        if is_prime(x):
+            out.append(x)
+        x += 2
+
+    return out
+
+
+def safe_base(m: int) -> int:
+    """
+    SafeGear-style base:
+    start near log2(m), then increment until gcd(b,m)=1.
+    """
+    b = math.floor(math.log2(max(m, 2))) + 1
+    while math.gcd(b, m) != 1:
+        b += 1
+    return b
+
+
+def shannon_entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+
+    n = len(data)
+    counts = Counter(data)
+
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def shake128_int(seed: bytes, byte_len: int) -> int:
+    return int.from_bytes(hashlib.shake_128(seed).digest(byte_len), "big")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 2 — CAUSAL ENTROPY WINDOW
+# ═══════════════════════════════════════════════════════════════════════
+
+class CausalEntropyWindow:
+    """
+    Uses only previously decoded chunks.
+    This is critical: encoder and decoder reproduce the same state path.
+    """
+
+    def __init__(self, W: int = 8, chunk_bytes: int = 5):
+        self.W = W
+        self.chunk_bytes = chunk_bytes
+        self.buffer = []
+
+    def push(self, C: int):
+        self.buffer.append(C)
+        if len(self.buffer) > self.W:
+            self.buffer.pop(0)
+
+    def estimate(self) -> float:
+        if not self.buffer:
+            return 0.0
+
+        data = b"".join(
+            int(c).to_bytes(self.chunk_bytes, "big")
+            for c in self.buffer
+        )
+        return shannon_entropy(data)
+
+    def reset(self):
+        self.buffer = []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 3 — SHARD STRUCTURE
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class HCCShard:
+    index: int
+    lane: int
+    phase: int
+    residues: List[int]
+    data_len: int
+    data_hmac: bytes
+    shard_hmac: bytes
+    n: int
+    geometry_dim: int
+    W: int
+    E_levels: int
+    chunk_bytes: int
+
+    def payload_bytes(self) -> bytes:
+        head = (
+            f"HCC|i={self.index}|lane={self.lane}|phase={self.phase}|"
+            f"len={self.data_len}|n={self.n}|D={self.geometry_dim}|"
+            f"W={self.W}|E={self.E_levels}|cb={self.chunk_bytes}|"
+        ).encode()
+
+        body = b"".join(
+            int(r).to_bytes(8, "big", signed=False)
+            for r in self.residues
+        )
+
+        return head + body
+
+    def compute_hmac(self, key: bytes) -> bytes:
+        return hmac.new(key, self.payload_bytes(), hashlib.sha256).digest()
+
+    def verify_hmac(self, key: bytes) -> bool:
+        return hmac.compare_digest(self.shard_hmac, self.compute_hmac(key))
+
+    def __repr__(self):
+        return (
+            f"HCCShard(i={self.index}, lane={self.lane}, "
+            f"phase={self.phase}, chunks={len(self.residues)})"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 4 — PRIME TOPOLOGY
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_prime_table(n: int, E_levels: int, start: int = 2003) -> List[List[int]]:
+    """
+    PRIME_TABLE[i][e] gives shard i's prime at entropy level e.
+
+    Larger entropy levels get larger primes.
+    All entries are unique.
+    """
+    pool = primes_from(start, n * E_levels + 100)
+
+    table = []
+    for i in range(n):
+        row = []
+        for e in range(E_levels):
+            row.append(pool[i * E_levels + e])
+        table.append(row)
+
+    return table
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 5 — HYPERMORPHIC CORRIDOR CODE
+# ═══════════════════════════════════════════════════════════════════════
+
+class HyperMorphicCorridorCode:
+    """
+    HyperMorphic Corridor Code.
+
+    Difference from fixed threshold coding:
+      Fixed threshold code:
+          recoverable iff |S| >= k
+
+      Corridor code:
+          recoverable iff S spans a valid reconstruction corridor.
+
+    Corridor validity depends on:
+      - algebraic capacity
+      - geometry lane coverage
+      - lane entropy
+      - angular spread
+      - local causal entropy state
+    """
+
+    def __init__(
+        self,
+        n: int = 12,
+        geometry_dim: int = 4,
+        W: int = 8,
+        E_levels: int = 9,
+        low_shards: int = 4,
+        high_shards: int = 6,
+        auth_key: bytes = b"HCC-demo-key-v1",
+    ):
+        assert n >= geometry_dim >= 2
+        assert 2 <= low_shards <= high_shards <= n
+
+        self.n = n
+        self.D = geometry_dim
+        self.W = W
+        self.E_levels = E_levels
+        self.low_shards = low_shards
+        self.high_shards = high_shards
+        self.auth_key = auth_key
+
+        # Each shard sits on a representation lane.
+        # Round-robin assignment gives balanced geometric axes.
+        self.lanes = [i % self.D for i in range(n)]
+        self.phases = [i // self.D for i in range(n)]
+
+        self.prime_table = build_prime_table(n, E_levels)
+
+        # Conservative chunk size:
+        # even the lowest entropy state with low_shards must have enough product.
+        primes0 = sorted(self.prime_table[i][0] for i in range(n))
+        prod_low = reduce(lambda a, b: a * b, primes0[:self.low_shards], 1)
+
+        self.chunk_bytes = max(1, int(math.log(prod_low - 1, 256)))
+        self.max_chunk = 256 ** self.chunk_bytes - 1
+
+        if prod_low <= self.max_chunk:
+            raise ValueError("Prime table too small for chosen chunk size")
+
+        self.base_table = [
+            [safe_base(self.prime_table[i][e]) for e in range(E_levels)]
+            for i in range(n)
+        ]
+
+        self.inv_cache = {}
+        for i in range(n):
+            for e in range(E_levels):
+                p = self.prime_table[i][e]
+                b = self.base_table[i][e]
+                self.inv_cache[(b, p)] = modinv(b, p)
+
+        self._subset_cache = {}
+
+        self._verify_invariants()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Invariants
+    # ──────────────────────────────────────────────────────────────────
+
+    def _verify_invariants(self):
+        flat = [p for row in self.prime_table for p in row]
+
+        assert all(is_prime(p) for p in flat), "Non-prime in prime table"
+        assert len(set(flat)) == len(flat), "Duplicate primes"
+
+        for e in range(self.E_levels):
+            assert len(set(self.prime_table[i][e] for i in range(self.n))) == self.n
+
+        for i in range(self.n):
+            for e in range(self.E_levels):
+                assert math.gcd(self.base_table[i][e], self.prime_table[i][e]) == 1
+
+        for e in range(self.E_levels):
+            primes = sorted(self.prime_table[i][e] for i in range(self.n))
+            prod = reduce(lambda a, b: a * b, primes[:self.low_shards], 1)
+            assert prod > self.max_chunk
+
+    # ──────────────────────────────────────────────────────────────────
+    # State and parameters
+    # ──────────────────────────────────────────────────────────────────
+
+    def _quantize_entropy(self, H: float) -> int:
+        """
+        H in [0,8] bits/byte → entropy level.
+        """
+        return min(int((H / 8.0) * self.E_levels), self.E_levels - 1)
+
+    def _required_shards(self, e: int) -> int:
+        """
+        State-dependent shard floor.
+        Low entropy can recover with fewer shards.
+        High entropy demands stronger corridor evidence.
+        """
+        if self.E_levels <= 1:
+            return self.low_shards
+
+        return self.low_shards + round(
+            (self.high_shards - self.low_shards) * e / (self.E_levels - 1)
+        )
+
+    def _required_lanes(self, e: int) -> int:
+        """
+        Low entropy: at least 2 geometry axes.
+        High entropy: full lane span.
+        """
+        if self.E_levels <= 1:
+            return min(2, self.D)
+
+        return min(
+            self.D,
+            2 + round((self.D - 2) * e / (self.E_levels - 1))
+        )
+
+    def _required_score(self, e: int) -> float:
+        """
+        State-dependent corridor score threshold.
+        """
+        return 0.36 + 0.26 * (e / max(1, self.E_levels - 1))
+
+    def _lambda(self, i: int, pos: int, prime: int, e: int) -> int:
+        """
+        Position/state-dependent mixing term.
+        """
+        seed = (
+            b"HCC-lambda|"
+            + i.to_bytes(2, "big")
+            + pos.to_bytes(6, "big")
+            + e.to_bytes(2, "big")
+        )
+        return shake128_int(seed, 8) % prime
+
+    def _params_for(self, i: int, e: int):
+        p = self.prime_table[i][e]
+        b = self.base_table[i][e]
+        inv = self.inv_cache[(b, p)]
+        return p, b, inv
+
+    # ──────────────────────────────────────────────────────────────────
+    # Byte chunking
+    # ──────────────────────────────────────────────────────────────────
+
+    def _pad(self, data: bytes) -> bytes:
+        pad = (-len(data)) % self.chunk_bytes
+        return data + bytes(pad)
+
+    def _to_chunks(self, data: bytes) -> List[int]:
+        cb = self.chunk_bytes
+        return [
+            int.from_bytes(data[i:i + cb], "big")
+            for i in range(0, len(data), cb)
+        ]
+
+    def _from_chunks(self, chunks: List[int]) -> bytes:
+        return b"".join(
+            int(c).to_bytes(self.chunk_bytes, "big")
+            for c in chunks
+        )
+
+    def _data_hmac(self, data: bytes) -> bytes:
+        return hmac.new(
+            self.auth_key,
+            b"HCC-data|" + data,
+            hashlib.sha256
+        ).digest()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Encode
+    # ──────────────────────────────────────────────────────────────────
+
+    def encode(self, data: bytes) -> List[HCCShard]:
+        padded = self._pad(data)
+        chunks = self._to_chunks(padded)
+
+        residue_lists = [[] for _ in range(self.n)]
+        window = CausalEntropyWindow(self.W, self.chunk_bytes)
+
+        for pos, C in enumerate(chunks):
+            H = window.estimate()
+            e = self._quantize_entropy(H)
+
+            for i in range(self.n):
+                p, b, _ = self._params_for(i, e)
+                lam = self._lambda(i, pos, p, e)
+                r = (b * C + lam) % p
+                residue_lists[i].append(r)
+
+            window.push(C)
+
+        data_hmac = self._data_hmac(data)
+
+        shards = []
+        for i in range(self.n):
+            s = HCCShard(
+                index=self.lanes.index(self.lanes[i]) if False else i,
+                lane=self.lanes[i],
+                phase=self.phases[i],
+                residues=residue_lists[i],
+                data_len=len(data),
+                data_hmac=data_hmac,
+                shard_hmac=b"",
+                n=self.n,
+                geometry_dim=self.D,
+                W=self.W,
+                E_levels=self.E_levels,
+                chunk_bytes=self.chunk_bytes,
+            )
+            s.shard_hmac = s.compute_hmac(self.auth_key)
+            shards.append(s)
+
+        return shards
+
+    # ──────────────────────────────────────────────────────────────────
+    # Corridor metrics
+    # ──────────────────────────────────────────────────────────────────
+
+    def corridor_metrics(self, indices: List[int], e: int) -> Dict[str, float]:
+        idx = tuple(sorted(indices))
+        lanes = [self.lanes[i] for i in idx]
+        lane_counts = Counter(lanes)
+
+        lane_coverage = len(lane_counts) / self.D
+
+        n = len(lanes)
+        if n == 0:
+            lane_entropy = 0.0
+            angular_spread = 0.0
+        else:
+            lane_entropy = -sum(
+                (c / n) * math.log2(c / n)
+                for c in lane_counts.values()
+            ) / math.log2(self.D)
+
+            vx = 0.0
+            vy = 0.0
+            for lane in lanes:
+                theta = 2 * math.pi * lane / self.D
+                vx += math.cos(theta)
+                vy += math.sin(theta)
+
+            resultant = math.sqrt(vx * vx + vy * vy) / n
+            angular_spread = 1.0 - resultant
+
+        moduli = [self.prime_table[i][e] for i in idx]
+        product = reduce(lambda a, b: a * b, moduli, 1)
+
+        capacity_bytes = math.log(product, 256) if product > 0 else 0.0
+        capacity_margin = capacity_bytes - self.chunk_bytes
+        capacity_score = min(
+            1.0,
+            max(0.0, capacity_margin / max(1, self.chunk_bytes))
+        )
+
+        score = (
+            0.38 * lane_coverage
+            + 0.30 * lane_entropy
+            + 0.22 * angular_spread
+            + 0.10 * capacity_score
+        )
+
+        return {
+            "size": len(idx),
+            "lanes": len(lane_counts),
+            "lane_coverage": lane_coverage,
+            "lane_entropy": lane_entropy,
+            "angular_spread": angular_spread,
+            "product": product,
+            "capacity_bytes": capacity_bytes,
+            "capacity_margin": capacity_margin,
+            "capacity_score": capacity_score,
+            "corridor_score": score,
+            "required_shards": self._required_shards(e),
+            "required_lanes": self._required_lanes(e),
+            "required_score": self._required_score(e),
+        }
+
+    def corridor_valid(self, indices: List[int], e: int) -> bool:
+        m = self.corridor_metrics(indices, e)
+
+        return (
+            m["size"] >= m["required_shards"]
+            and m["lanes"] >= m["required_lanes"]
+            and m["product"] > self.max_chunk
+            and m["corridor_score"] >= m["required_score"]
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Shard validation and subset selection
+    # ──────────────────────────────────────────────────────────────────
+
+    def _valid_shards(
+        self,
+        shards: List[Optional[HCCShard]],
+        require_hmac: bool = True,
+    ) -> List[HCCShard]:
+
+        out = []
+        seen = set()
+
+        for s in shards:
+            if s is None or not isinstance(s, HCCShard):
+                continue
+
+            if s.index in seen:
+                continue
+
+            if require_hmac and not s.verify_hmac(self.auth_key):
+                continue
+
+            if (
+                s.n != self.n
+                or s.geometry_dim != self.D
+                or s.W != self.W
+                or s.E_levels != self.E_levels
+                or s.chunk_bytes != self.chunk_bytes
+            ):
+                continue
+
+            out.append(s)
+            seen.add(s.index)
+
+        return sorted(out, key=lambda s: s.index)
+
+    def _select_corridor_subset(self, available: List[HCCShard], e: int) -> List[HCCShard]:
+        available = sorted(available, key=lambda s: s.index)
+        ids = tuple(s.index for s in available)
+
+        key = (ids, e)
+        if key in self._subset_cache:
+            selected_ids = self._subset_cache[key]
+            smap = {s.index: s for s in available}
+            return [smap[i] for i in selected_ids]
+
+        # Fast path: all surviving shards form a corridor.
+        all_idx = list(ids)
+        if self.corridor_valid(all_idx, e):
+            self._subset_cache[key] = tuple(all_idx)
+            return available
+
+        # Search for the smallest valid corridor.
+        req = self._required_shards(e)
+        best_tuple = None
+        best_value = None
+
+        for r in range(req, len(available) + 1):
+            for combo in combinations(ids, r):
+                if self.corridor_valid(list(combo), e):
+                    metrics = self.corridor_metrics(list(combo), e)
+                    value = (
+                        metrics["corridor_score"],
+                        metrics["capacity_margin"],
+                    )
+
+                    if best_value is None or value > best_value:
+                        best_value = value
+                        best_tuple = combo
+
+            if best_tuple is not None:
+                break
+
+        if best_tuple is None:
+            raise ValueError(
+                f"No valid reconstruction corridor at entropy level {e}; "
+                f"available={list(ids)}"
+            )
+
+        self._subset_cache[key] = tuple(best_tuple)
+        smap = {s.index: s for s in available}
+
+        return [smap[i] for i in best_tuple]
+
+    # ──────────────────────────────────────────────────────────────────
+    # Decode
+    # ──────────────────────────────────────────────────────────────────
+
+    def _reconstruct(
+        self,
+        available: List[HCCShard],
+        data_len: int,
+        collect_certificate: bool = False,
+    ):
+        if not available:
+            raise ValueError("No shards")
+
+        n_chunks = len(available[0].residues)
+        for s in available:
+            if len(s.residues) != n_chunks:
+                raise ValueError("Mismatched shard lengths")
+
+        window = CausalEntropyWindow(self.W, self.chunk_bytes)
+        chunks = []
+
+        cert = {
+            "positions": n_chunks,
+            "entropy_levels": [],
+            "subset_sizes": [],
+            "lane_counts": [],
+            "corridor_scores": [],
+            "capacity_margins": [],
+            "selected_subsets_sample": [],
+        }
+
+        for pos in range(n_chunks):
+            H = window.estimate()
+            e = self._quantize_entropy(H)
+
+            selected = self._select_corridor_subset(available, e)
+            indices = [s.index for s in selected]
+            metrics = self.corridor_metrics(indices, e)
+
+            residues = []
+            moduli = []
+
+            for s in selected:
+                p, b, inv_b = self._params_for(s.index, e)
+                lam = self._lambda(s.index, pos, p, e)
+                r = s.residues[pos]
+
+                c = ((r - lam) * inv_b) % p
+
+                residues.append(c)
+                moduli.append(p)
+
+            C = crt(residues, moduli)
+
+            if C > self.max_chunk:
+                raise ValueError("CRT output outside chunk range")
+
+            chunks.append(C)
+            window.push(C)
+
+            if collect_certificate:
+                cert["entropy_levels"].append(e)
+                cert["subset_sizes"].append(len(indices))
+                cert["lane_counts"].append(metrics["lanes"])
+                cert["corridor_scores"].append(metrics["corridor_score"])
+                cert["capacity_margins"].append(metrics["capacity_margin"])
+
+                if len(cert["selected_subsets_sample"]) < 12:
+                    cert["selected_subsets_sample"].append({
+                        "pos": pos,
+                        "entropy_level": e,
+                        "indices": indices,
+                        "lanes": [self.lanes[i] for i in indices],
+                        "score": round(metrics["corridor_score"], 4),
+                        "capacity_margin_bytes": round(metrics["capacity_margin"], 4),
+                    })
+
+        raw = self._from_chunks(chunks)
+        data = raw[:data_len]
+
+        if not hmac.compare_digest(self._data_hmac(data), available[0].data_hmac):
+            raise ValueError("Data HMAC failed: corridor did not reconstruct original data")
+
+        if not collect_certificate:
+            return data
+
+        cert["entropy_level_dist"] = dict(Counter(cert["entropy_levels"]))
+        cert["subset_size_dist"] = dict(Counter(cert["subset_sizes"]))
+        cert["lane_count_dist"] = dict(Counter(cert["lane_counts"]))
+        cert["min_corridor_score"] = round(min(cert["corridor_scores"]), 5)
+        cert["min_capacity_margin_bytes"] = round(min(cert["capacity_margins"]), 5)
+        cert["max_required_shards_seen"] = max(
+            self._required_shards(e) for e in cert["entropy_levels"]
+        )
+        cert["max_required_lanes_seen"] = max(
+            self._required_lanes(e) for e in cert["entropy_levels"]
+        )
+
+        return data, cert
+
+    def decode(self, shards: List[Optional[HCCShard]]) -> bytes:
+        valid = self._valid_shards(shards, require_hmac=True)
+
+        if len(valid) < self.low_shards:
+            raise ValueError(
+                f"Need at least {self.low_shards} valid shards before corridor search; "
+                f"have {len(valid)}"
+            )
+
+        return self._reconstruct(valid, valid[0].data_len, collect_certificate=False)
+
+    def decode_with_certificate(self, shards: List[Optional[HCCShard]]) -> Tuple[bytes, Dict]:
+        valid = self._valid_shards(shards, require_hmac=True)
+
+        if len(valid) < self.low_shards:
+            raise ValueError(
+                f"Need at least {self.low_shards} valid shards before corridor search; "
+                f"have {len(valid)}"
+            )
+
+        return self._reconstruct(valid, valid[0].data_len, collect_certificate=True)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Byzantine consensus decoding
+    # ──────────────────────────────────────────────────────────────────
+
+    def decode_byzantine(
+        self,
+        shards: List[Optional[HCCShard]],
+        max_subset_size: int = None,
+    ):
+        """
+        Byzantine-tolerant consensus decode.
+
+        It tries many corridor-valid subsets and chooses the majority
+        reconstruction. This is expensive but useful for proof/demo.
+        """
+        valid = self._valid_shards(shards, require_hmac=False)
+
+        if len(valid) < self.low_shards:
+            raise ValueError("Not enough physical shards")
+
+        if max_subset_size is None:
+            max_subset_size = min(self.n, self.high_shards + 1)
+
+        candidates = defaultdict(int)
+        data_for_hash = {}
+        good_combos_by_hash = defaultdict(list)
+
+        ids = [s.index for s in valid]
+        smap = {s.index: s for s in valid}
+
+        for r in range(self.low_shards, min(max_subset_size, len(valid)) + 1):
+            for combo in combinations(ids, r):
+                subset = [smap[i] for i in combo]
+
+                try:
+                    data = self._reconstruct(
+                        subset,
+                        subset[0].data_len,
+                        collect_certificate=False,
+                    )
+                    dh = hashlib.sha256(data).digest()
+
+                    candidates[dh] += 1
+                    data_for_hash[dh] = data
+                    good_combos_by_hash[dh].append(combo)
+
+                except Exception:
+                    pass
+
+        if not candidates:
+            raise ValueError("No consensus reconstruction found")
+
+        best = max(candidates, key=candidates.get)
+        data = data_for_hash[best]
+        combos = good_combos_by_hash[best]
+
+        participation = Counter(i for combo in combos for i in combo)
+
+        good = sorted(i for i, c in participation.items() if c > 0)
+        bad = sorted(
+            i for i in ids
+            if i not in good or not smap[i].verify_hmac(self.auth_key)
+        )
+
+        report = {
+            "consensus_votes": candidates[best],
+            "candidate_count": len(candidates),
+            "tested_successful_combos": sum(candidates.values()),
+            "good_shards": good,
+            "bad_or_suspicious_shards": bad,
+            "participation": dict(participation),
+        }
+
+        return data, report
+
+    # ──────────────────────────────────────────────────────────────────
+    # Analysis
+    # ──────────────────────────────────────────────────────────────────
+
+    def analyse(self, data: bytes = None) -> Dict:
+        info = {
+            "n": self.n,
+            "geometry_dim": self.D,
+            "W": self.W,
+            "E_levels": self.E_levels,
+            "low_shards": self.low_shards,
+            "high_shards": self.high_shards,
+            "chunk_bytes": self.chunk_bytes,
+            "max_chunk": self.max_chunk,
+            "lanes": {i: self.lanes[i] for i in range(self.n)},
+        }
+
+        levels = []
+        for e in range(self.E_levels):
+            primes = sorted(self.prime_table[i][e] for i in range(self.n))
+            req = self._required_shards(e)
+            prod = reduce(lambda a, b: a * b, primes[:req], 1)
+
+            levels.append({
+                "level": e,
+                "required_shards": req,
+                "required_lanes": self._required_lanes(e),
+                "required_score": round(self._required_score(e), 4),
+                "min_prime": primes[0],
+                "max_prime": primes[-1],
+                "capacity_bytes": round(math.log(prod, 256), 4),
+            })
+
+        info["level_stats"] = levels
+
+        if data is not None:
+            padded = self._pad(data)
+            chunks = self._to_chunks(padded)
+            window = CausalEntropyWindow(self.W, self.chunk_bytes)
+
+            trace = []
+            for C in chunks:
+                H = window.estimate()
+                e = self._quantize_entropy(H)
+                trace.append(e)
+                window.push(C)
+
+            info["data_entropy_level_dist"] = dict(Counter(trace))
+
+        return info
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 6 — TEST SUITE
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_tests():
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  HyperMorphic Corridor Code — Test Suite                            ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    hcc = HyperMorphicCorridorCode()
+    results = []
+
+    def check(name, condition, note=""):
+        results.append(bool(condition))
+        icon = "✅" if condition else "❌"
+        print(f"  {icon} {name:<65} {note}")
+
+    def section(title):
+        print("\n" + "─" * 78)
+        print(" ", title)
+        print("─" * 78)
+
+    # 1. Basic roundtrip
+    section("1. BASIC ROUNDTRIP")
+
+    test_cases = [
+        ("short string", b"HyperMorphic Corridor Code"),
+        ("single byte", b"x"),
+        ("all zeros", bytes(512)),
+        ("full range", bytes(range(256)) * 2),
+        ("random 2KB", os.urandom(2048)),
+        ("repeated phrase", b"corridor-code-" * 200),
+    ]
+
+    for name, data in test_cases:
+        shards = hcc.encode(data)
+        recovered = hcc.decode(shards)
+        check(f"Roundtrip: {name}", recovered == data, f"len={len(data)}")
+
+    # 2. Corridor property
+    section("2. VARIABLE CORRIDOR PROPERTY")
+
+    low = bytes([7]) * 512
+    shards_low = hcc.encode(low)
+
+    low_ids = [0, 1, 4, 5]  # 4 shards, lanes 0/1 only
+    low_subset = [shards_low[i] if i in low_ids else None for i in range(hcc.n)]
+
+    try:
+        recovered = hcc.decode(low_subset)
+        check(
+            "Low entropy: 4 shards over 2 lanes recover",
+            recovered == low,
+            f"ids={low_ids}, lanes={[hcc.lanes[i] for i in low_ids]}",
+        )
+    except Exception as ex:
+        check("Low entropy: 4 shards over 2 lanes recover", False, str(ex))
+
+    high = os.urandom(2048)
+    shards_high = hcc.encode(high)
+
+    good_ids = [0, 1, 2, 3, 4, 5]      # 6 shards, all 4 lanes
+    bad_ids = [0, 1, 4, 5, 8, 9]       # 6 shards, only lanes 0/1
+
+    for label, ids, should_pass in [
+        ("High entropy: 6 shards with full geometry span recover", good_ids, True),
+        ("High entropy: 6 shards with poor geometry span fail", bad_ids, False),
+    ]:
+        subset = [shards_high[i] if i in ids else None for i in range(hcc.n)]
+
+        try:
+            recovered = hcc.decode(subset)
+            ok = recovered == high
+            check(
+                label,
+                ok == should_pass,
+                f"ids={ids}, lanes={[hcc.lanes[i] for i in ids]}, recovered={ok}",
+            )
+
+        except Exception as ex:
+            check(
+                label,
+                should_pass is False,
+                f"ids={ids}, lanes={[hcc.lanes[i] for i in ids]}, fail={str(ex)[:70]}",
+            )
+
+    # 3. Same count, different geometry
+    section("3. SAME SHARD COUNT, DIFFERENT GEOMETRY")
+
+    m_good = hcc.corridor_metrics(good_ids, e=hcc.E_levels - 1)
+    m_bad = hcc.corridor_metrics(bad_ids, e=hcc.E_levels - 1)
+
+    check(
+        "Good 6-shard subset has enough lanes",
+        m_good["lanes"] >= m_good["required_lanes"],
+        f"lanes={m_good['lanes']}, required={m_good['required_lanes']}",
+    )
+
+    check(
+        "Bad 6-shard subset fails lane requirement",
+        m_bad["lanes"] < m_bad["required_lanes"],
+        f"lanes={m_bad['lanes']}, required={m_bad['required_lanes']}",
+    )
+
+    check(
+        "Good corridor score exceeds bad corridor score",
+        m_good["corridor_score"] > m_bad["corridor_score"],
+        f"good={m_good['corridor_score']:.4f}, bad={m_bad['corridor_score']:.4f}",
+    )
+
+    # 4. Certificate
+    section("4. CORRIDOR CERTIFICATE")
+
+    data = os.urandom(1024)
+    shards = hcc.encode(data)
+
+    # Erase several shards, leaving a recoverable corridor.
+    for i in [6, 7, 10]:
+        shards[i] = None
+
+    recovered, cert = hcc.decode_with_certificate(shards)
+
+    check("Decode with certificate", recovered == data)
+    check("Certificate has entropy-level distribution", "entropy_level_dist" in cert)
+    check("Certificate has subset-size distribution", "subset_size_dist" in cert)
+    check("Certificate records selected subset samples", len(cert["selected_subsets_sample"]) > 0)
+
+    print("\n  Certificate summary:")
+    print(f"    entropy_level_dist:        {cert['entropy_level_dist']}")
+    print(f"    subset_size_dist:          {cert['subset_size_dist']}")
+    print(f"    lane_count_dist:           {cert['lane_count_dist']}")
+    print(f"    min_corridor_score:        {cert['min_corridor_score']}")
+    print(f"    min_capacity_margin_bytes: {cert['min_capacity_margin_bytes']}")
+    print(f"    sample:                    {cert['selected_subsets_sample'][:2]}")
+
+    # 5. HMAC integrity
+    section("5. INTEGRITY AND BYZANTINE TESTS")
+
+    msg = b"Byzantine corridor test payload" * 30
+    shards = hcc.encode(msg)
+
+    tampered = [copy.deepcopy(s) for s in shards]
+    tampered[0].residues[0] ^= 1
+
+    valid_after = hcc._valid_shards(tampered, require_hmac=True)
+    check(
+        "Shard HMAC rejects tampered shard",
+        0 not in [s.index for s in valid_after],
+        f"{len(valid_after)}/{hcc.n} pass HMAC",
+    )
+
+    recovered, report = hcc.decode_byzantine(tampered)
+
+    check("Byzantine consensus recovers with 1 corrupted shard", recovered == msg)
+    check(
+        "Byzantine report flags suspicious shard",
+        0 in report["bad_or_suspicious_shards"],
+        f"bad={report['bad_or_suspicious_shards']}",
+    )
+
+    # 6. Erasure stress
+    section("6. ERASURE STRESS")
+
+    data = os.urandom(2048)
+    shards = hcc.encode(data)
+
+    # Keep one full good corridor and erase the rest.
+    keep = [0, 1, 2, 3, 4, 5]
+    erased = [shards[i] if i in keep else None for i in range(hcc.n)]
+
+    try:
+        recovered = hcc.decode(erased)
+        check(
+            "Recover from exactly one 6-shard full-span corridor",
+            recovered == data,
+            f"keep={keep}, lanes={[hcc.lanes[i] for i in keep]}",
+        )
+    except Exception as ex:
+        check("Recover from exactly one 6-shard full-span corridor", False, str(ex))
+
+    # 7. Results
+    section("SUMMARY")
+
+    passed = sum(results)
+    total = len(results)
+
+    print(f"  RESULTS: {passed}/{total} passed")
+
+    if passed == total:
+        print("  ✅ ALL PASS — HCC primitive validated")
+    else:
+        print(f"  ❌ {total - passed} failures")
+
+    return passed == total
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 7 — FORMAL ANALYSIS / PRINTABLE REPORT
+# ═══════════════════════════════════════════════════════════════════════
+
+def formal_analysis():
+    print("\n╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  HCC FORMAL ANALYSIS — Geometry, Capacity, Corridor Conditions       ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    hcc = HyperMorphicCorridorCode()
+    info = hcc.analyse()
+
+    print("\n  PARAMETERS")
+    print(f"    n:              {hcc.n}")
+    print(f"    geometry_dim D: {hcc.D}")
+    print(f"    W:              {hcc.W}")
+    print(f"    E_levels:       {hcc.E_levels}")
+    print(f"    low_shards:     {hcc.low_shards}")
+    print(f"    high_shards:    {hcc.high_shards}")
+    print(f"    chunk_bytes:    {hcc.chunk_bytes}")
+    print(f"    lane map:        {info['lanes']}")
+
+    print("\n  STATE-DEPENDENT CORRIDOR REQUIREMENTS")
+    print(f"    {'level':>5}  {'req shards':>10}  {'req lanes':>9}  {'req score':>9}  {'prime range':>15}  {'capacity(B)':>12}")
+    print(f"    {'─'*5}  {'─'*10}  {'─'*9}  {'─'*9}  {'─'*15}  {'─'*12}")
+
+    for row in info["level_stats"]:
+        prange = f"{row['min_prime']}–{row['max_prime']}"
+        print(
+            f"    {row['level']:>5}  "
+            f"{row['required_shards']:>10}  "
+            f"{row['required_lanes']:>9}  "
+            f"{row['required_score']:>9.4f}  "
+            f"{prange:>15}  "
+            f"{row['capacity_bytes']:>12.4f}"
+        )
+
+    print("\n  CORE CLAIM DEMONSTRATION")
+    print("    Fixed threshold codes count shards.")
+    print("    Corridor codes count surviving invariant span.")
+    print("    Therefore, two subsets with the same shard count can differ:")
+    print("      - full-span subset: valid corridor")
+    print("      - clustered subset: invalid corridor")
+
+    good_ids = [0, 1, 2, 3, 4, 5]
+    bad_ids = [0, 1, 4, 5, 8, 9]
+    e = hcc.E_levels - 1
+
+    good = hcc.corridor_metrics(good_ids, e)
+    bad = hcc.corridor_metrics(bad_ids, e)
+
+    print("\n  SAME COUNT COMPARISON AT HIGH ENTROPY")
+    print(f"    good ids: {good_ids}, lanes={[hcc.lanes[i] for i in good_ids]}")
+    print(f"      lanes={good['lanes']}, score={good['corridor_score']:.4f}, valid={hcc.corridor_valid(good_ids, e)}")
+    print(f"    bad ids:  {bad_ids}, lanes={[hcc.lanes[i] for i in bad_ids]}")
+    print(f"      lanes={bad['lanes']}, score={bad['corridor_score']:.4f}, valid={hcc.corridor_valid(bad_ids, e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 8 — PERFORMANCE BENCHMARK
+# ═══════════════════════════════════════════════════════════════════════
+
+def performance_benchmark():
+    print("\n╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  HCC PERFORMANCE BENCHMARK                                          ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    hcc = HyperMorphicCorridorCode()
+
+    print("\n  Note: pure Python CRT prototype, not optimized.")
+    print(f"  {'size':>10}  {'enc KB/s':>12}  {'dec KB/s':>12}  {'enc ms':>10}  {'dec ms':>10}")
+    print(f"  {'─'*10}  {'─'*12}  {'─'*12}  {'─'*10}  {'─'*10}")
+
+    for size in [100, 1000, 10000, 50000]:
+        data = os.urandom(size)
+
+        t0 = time.perf_counter()
+        for _ in range(3):
+            shards = hcc.encode(data)
+        t_enc = (time.perf_counter() - t0) / 3
+
+        t0 = time.perf_counter()
+        for _ in range(3):
+            recovered = hcc.decode(shards)
+        t_dec = (time.perf_counter() - t0) / 3
+
+        assert recovered == data
+
+        enc_kbs = size / t_enc / 1024
+        dec_kbs = size / t_dec / 1024
+
+        print(
+            f"  {size:>10}  "
+            f"{enc_kbs:>12.1f}  "
+            f"{dec_kbs:>12.1f}  "
+            f"{t_enc*1000:>10.2f}  "
+            f"{t_dec*1000:>10.2f}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# RUN EVERYTHING
+# ═══════════════════════════════════════════════════════════════════════
+
+all_pass = run_tests()
+formal_analysis()
+performance_benchmark()
+
+
+
+
+
+
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  HyperMorphic Corridor Code — Test Suite                            ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+──────────────────────────────────────────────────────────────────────────────
+  1. BASIC ROUNDTRIP
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Roundtrip: short string                                           len=26
+  ✅ Roundtrip: single byte                                            len=1
+  ✅ Roundtrip: all zeros                                              len=512
+  ✅ Roundtrip: full range                                             len=512
+  ✅ Roundtrip: random 2KB                                             len=2048
+  ✅ Roundtrip: repeated phrase                                        len=2800
+
+──────────────────────────────────────────────────────────────────────────────
+  2. VARIABLE CORRIDOR PROPERTY
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Low entropy: 4 shards over 2 lanes recover                        ids=[0, 1, 4, 5], lanes=[0, 1, 0, 1]
+  ✅ High entropy: 6 shards with full geometry span recover            ids=[0, 1, 2, 3, 4, 5], lanes=[0, 1, 2, 3, 0, 1], recovered=True
+  ✅ High entropy: 6 shards with poor geometry span fail               ids=[0, 1, 4, 5, 8, 9], lanes=[0, 1, 0, 1, 0, 1], fail=No valid reconstruction corridor at entropy level 3; available=[0, 1, 
+
+──────────────────────────────────────────────────────────────────────────────
+  3. SAME SHARD COUNT, DIFFERENT GEOMETRY
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Good 6-shard subset has enough lanes                              lanes=4, required=4
+  ✅ Bad 6-shard subset fails lane requirement                         lanes=2, required=4
+  ✅ Good corridor score exceeds bad corridor score                    good=0.9028, bad=0.4726
+
+──────────────────────────────────────────────────────────────────────────────
+  4. CORRIDOR CERTIFICATE
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Decode with certificate                                           
+  ✅ Certificate has entropy-level distribution                        
+  ✅ Certificate has subset-size distribution                          
+  ✅ Certificate records selected subset samples                       
+
+  Certificate summary:
+    entropy_level_dist:        {0: 1, 2: 1, 3: 1, 4: 2, 5: 200}
+    subset_size_dist:          {9: 205}
+    lane_count_dist:           {4: 205}
+    min_corridor_score:        0.929
+    min_capacity_margin_bytes: 7.58388
+    sample:                    [{'pos': 0, 'entropy_level': 0, 'indices': [0, 1, 2, 3, 4, 5, 8, 9, 11], 'lanes': [0, 1, 2, 3, 0, 1, 0, 1, 3], 'score': 0.929, 'capacity_margin_bytes': 7.5839}, {'pos': 1, 'entropy_level': 2, 'indices': [0, 1, 2, 3, 4, 5, 8, 9, 11], 'lanes': [0, 1, 2, 3, 0, 1, 0, 1, 3], 'score': 0.929, 'capacity_margin_bytes': 7.5931}]
+
+──────────────────────────────────────────────────────────────────────────────
+  5. INTEGRITY AND BYZANTINE TESTS
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Shard HMAC rejects tampered shard                                 11/12 pass HMAC
+  ✅ Byzantine consensus recovers with 1 corrupted shard               
+  ✅ Byzantine report flags suspicious shard                           bad=[0]
+
+──────────────────────────────────────────────────────────────────────────────
+  6. ERASURE STRESS
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Recover from exactly one 6-shard full-span corridor               keep=[0, 1, 2, 3, 4, 5], lanes=[0, 1, 2, 3, 0, 1]
+
+──────────────────────────────────────────────────────────────────────────────
+  SUMMARY
+──────────────────────────────────────────────────────────────────────────────
+  RESULTS: 20/20 passed
+  ✅ ALL PASS — HCC primitive validated
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  HCC FORMAL ANALYSIS — Geometry, Capacity, Corridor Conditions       ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+  PARAMETERS
+    n:              12
+    geometry_dim D: 4
+    W:              8
+    E_levels:       9
+    low_shards:     4
+    high_shards:    6
+    chunk_bytes:    5
+    lane map:        {0: 0, 1: 1, 2: 2, 3: 3, 4: 0, 5: 1, 6: 2, 7: 3, 8: 0, 9: 1, 10: 2, 11: 3}
+
+  STATE-DEPENDENT CORRIDOR REQUIREMENTS
+    level  req shards  req lanes  req score      prime range   capacity(B)
+    ─────  ──────────  ─────────  ─────────  ───────────────  ────────────
+        0           4          2     0.3600        2003–2767        5.5212
+        1           4          2     0.3925        2011–2777        5.5237
+        2           4          2     0.4250        2017–2789        5.5249
+        3           5          3     0.4575        2027–2791        6.9238
+        4           5          3     0.4900        2029–2797        6.9263
+        5           5          3     0.5225        2039–2801        6.9327
+        6           6          4     0.5550        2053–2803        8.3394
+        7           6          4     0.5875        2063–2819        8.3428
+        8           6          4     0.6200        2069–2833        8.3455
+
+  CORE CLAIM DEMONSTRATION
+    Fixed threshold codes count shards.
+    Corridor codes count surviving invariant span.
+    Therefore, two subsets with the same shard count can differ:
+      - full-span subset: valid corridor
+      - clustered subset: invalid corridor
+
+  SAME COUNT COMPARISON AT HIGH ENTROPY
+    good ids: [0, 1, 2, 3, 4, 5], lanes=[0, 1, 2, 3, 0, 1]
+      lanes=4, score=0.9028, valid=True
+    bad ids:  [0, 1, 4, 5, 8, 9], lanes=[0, 1, 0, 1, 0, 1]
+      lanes=2, score=0.4726, valid=False
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  HCC PERFORMANCE BENCHMARK                                          ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+  Note: pure Python CRT prototype, not optimized.
+        size      enc KB/s      dec KB/s      enc ms      dec ms
+  ──────────  ────────────  ────────────  ──────────  ──────────
+         100          93.6          45.9        1.04        2.13
+        1000         107.1          50.6        9.12       19.28
+       10000          98.7          49.3       98.91      198.06
+       50000         102.8          33.7      474.90     1448.81
+
